@@ -1,0 +1,31 @@
+import { describe, it, expect, vi } from 'vitest';
+import { collectSource, parseSource, getResponse, requestHeaders } from '../src/lib/collector';
+import type { Source, SourceStatus } from '../src/lib/schema';
+const now = '2026-10-09T10:00:00.000Z';
+const source: Source = { id: 'test', lab: 'openai', kind: 'rss', official: true, url: 'https://example.org/rss' };
+const rss = '<?xml version="1.0"?><rss version="2.0"><channel><title>Official</title><link>https://example.org</link><description>News</description><item><title>New model</title><link>https://example.org/new</link><pubDate>Thu, 01 Oct 2026 10:00:00 GMT</pubDate><description>Released</description></item></channel></rss>';
+const previous: SourceStatus = { id: 'test', state: 'healthy', checkedAt: now, lastSuccessAt: now, error: null, itemCount: 1, etag: 'x', lastModified: 'y' };
+describe('collector adapters', () => {
+  it('parses RSS title, date, URL and description', async () => { const result = await parseSource(source, rss, now); expect(result[0].title).toBe('New model'); expect(result[0].date).toContain('2026'); });
+  it('allows missing feed fields for normalizer rejection', async () => { const xml = rss.replace(/<title>New model<\/title>|<link>https:\/\/example.org\/new<\/link>|<pubDate>.*?<\/pubDate>|<description>Released<\/description>/g, ''); expect((await parseSource(source, xml, now))[0]).toEqual({ title: '', url: '', date: '', content: '' }); });
+  it('records HTTP failure without losing last valid state', async () => { const fetcher = vi.fn().mockResolvedValue(new Response('', { status: 503 })); const result = await collectSource(source, previous, now, fetcher); expect(result.status.state).toBe('failed'); expect(result.status.lastSuccessAt).toBe(previous.lastSuccessAt); expect(result.status.itemCount).toBe(1); expect(result.items).toEqual([]); });
+  it('handles first-run network failure', async () => { const fetcher = vi.fn().mockRejectedValue(new Error('offline')); const result = await collectSource(source, undefined, now, fetcher); expect(result.status.lastSuccessAt).toBeNull(); expect(result.status.error).toBe('offline'); });
+  it('reuses conditional HTTP metadata for 304', async () => { const fetcher = vi.fn().mockResolvedValue(new Response(null, { status: 304 })); const result = await collectSource(source, previous, now, fetcher); expect(result.status.itemCount).toBe(1); expect(result.status.state).toBe('healthy'); expect(fetcher.mock.calls[0][1].headers['If-None-Match']).toBe('x'); });
+  it('updates successful fetch metadata', async () => { const fetcher = vi.fn().mockResolvedValue(new Response(rss, { headers: { etag: 'new' } })); const result = await collectSource(source, undefined, now, fetcher); expect(result.status.etag).toBe('new'); expect(result.items).toHaveLength(1); });
+  it('parses only published releases and rejects invalid responses', async () => { const gh = { ...source, kind: 'github' as const, url: 'https://api.github.com/repos/openai/codex/releases' }; expect(await parseSource(gh, '[{"name":"v1","html_url":"https://github.com/openai/codex/releases/tag/v1","published_at":"2026-10-01","body":"Changes"},{"draft":true}]', now)).toHaveLength(1); await expect(parseSource(gh, '{}', now)).rejects.toThrow('Invalid'); expect((await parseSource(gh, '[{}]', now))[0].date).toBe(''); });
+  it('labels official commit activity with its real commit timestamp', async () => { const commits = { ...source, kind: 'commits' as const, url: 'https://api.github.com/repos/deepseek-ai/DeepSeek-V3/commits?per_page=100' }; const items = await parseSource(commits, JSON.stringify([{ sha: 'abc123456789', html_url: 'https://github.com/deepseek-ai/DeepSeek-V3/commit/abc123456789', commit: { message: 'Update model documentation\nDetails', committer: { date: '2026-10-01T10:00:00Z' } } }]), now); expect(items[0].title).toBe('DeepSeek-V3 · Developer activity: Update model documentation'); expect(items[0].date).toBe('2026-10-01T10:00:00Z'); await expect(parseSource(commits, '{}', now)).rejects.toThrow('Invalid'); });
+  it('keeps GitHub credentials on api.github.com only', () => { expect(requestHeaders('https://example.org', 'secret').Authorization).toBeUndefined(); expect(requestHeaders('https://api.github.com/repos/a/b', 'secret').Authorization).toBe('Bearer secret'); });
+  it('rejects oversized sources', async () => { await expect(getResponse(source.url, { fetcher: vi.fn().mockResolvedValue(new Response('', { headers: { 'content-length': '9000000' } })) })).rejects.toThrow('8 MB'); });
+  it('extracts actual publication date from HTML metadata and ignores external links', async () => {
+    const htmlSource = { ...source, kind: 'html' as const, selector: 'a' };
+    const fetcher = vi.fn().mockResolvedValue(new Response('<main><h1>Announcement</h1><meta property="article:published_time" content="2026-10-01"><article>Hello</article></main>'));
+    const items = await parseSource(htmlSource, '<a href="/new">News</a><a href="https://elsewhere.org/new">External</a>', now, fetcher);
+    expect(items).toHaveLength(1); expect(items[0].date).toBe('2026-10-01T00:00:00.000Z'); expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+  it.each([
+    '<script type="application/ld+json">{"@graph":[{"datePublished":"2026-10-01"}]}</script><h1>New</h1>',
+    '<script type="application/ld+json">invalid</script><time datetime="2026-10-01"></time><h1>New</h1>',
+    '<time>October 1, 2026</time><meta property="og:title" content="New"><meta name="description" content="Detail">'
+  ])('extracts JSON-LD and time dates without guessing', async html => { const fetcher = vi.fn().mockResolvedValue(new Response(html)); const result = await parseSource({ ...source, kind: 'html', selector: 'a' }, '<a href="/new">New</a>', now, fetcher); expect(result).toHaveLength(1); });
+  it('skips undated HTML and reports all-request failure', async () => { const html = { ...source, kind: 'html' as const }; expect(await parseSource(html, '<article><a href="/new">New</a></article>', now, vi.fn().mockResolvedValue(new Response('<h1>No date</h1>')))).toHaveLength(0); await expect(parseSource(html, '<article><a href="/new">New</a></article>', now, vi.fn().mockRejectedValue(new Error('fail')))).rejects.toThrow('All article'); });
+});

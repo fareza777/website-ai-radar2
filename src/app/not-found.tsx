@@ -1,0 +1,3 @@
+import Link from 'next/link';
+import { Icon } from '../components/icon';
+export default function NotFound() { return <main className="not-found"><Link className="brand" href="/"><span className="brand-mark"><Icon name="radar" size={26}/></span>AI Radar<span className="brand-dot">.</span></Link><div className="empty-icon"><Icon name="radar" size={32}/></div><p className="eyebrow">404 · SIGNAL NOT FOUND</p><h1>This signal is off the radar.</h1><p>The page may have moved, or the link may be incomplete. Your next AI discovery is still one click away.</p><div className="dialog-actions"><Link className="primary-button" href="/">Back to Today <Icon name="arrow" size={16}/></Link><Link className="secondary-button" href="/labs">Explore AI labs</Link></div></main>; }
